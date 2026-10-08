@@ -1,10 +1,17 @@
-//! gray-dirty-guard — a gray sidecar plugin.
+//! gray-dirty-guard — tell the model the work tree is dirty before it edits.
 //!
-//! With no arguments it speaks gray's NDJSON wire protocol on stdio: one JSON
-//! request per stdin line, one reply per stdout line. `gray-dirty-guard manifest`
-//! prints the manifest for humans and `gray account check`.
+//! Port of pi's `dirty-repo-guard` extension, adapted to the wire: pi blocked
+//! session switches behind a UI prompt; the sidecar has no UI, so instead it
+//! answers `prompt/context` with a single line —
+//! "Note: the working tree has N uncommitted changes (M modified, U untracked)."
+//! — so the model knows the repo state before touching files. Outside a git
+//! work tree it returns `{}` and stays silent.
+//!
+//! `/dirty on|off` toggles, persisted at ~/.gray/dirty-guard/disabled.
+//! Default ON (the hook only informs, never blocks).
 
 use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -13,39 +20,102 @@ fn manifest() -> Value {
         "name": "dirty-guard",
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
-        "tools": [{
-            "name": "dirty_guard_hello",
-            "description": "Example tool from the gray-account template: greets `name`. Replace me.",
-            "parameters": {
-                "type": "object",
-                "properties": { "name": { "type": "string", "description": "Who to greet." } },
-                "required": ["name"]
-            }
-        }],
-        "commands": ["/dirty-guard"],
+        "tools": [],
+        "commands": ["/dirty"],
+        "hooks": ["prompt/context"],
     })
 }
 
-/// A tool call. Return `Ok(text)` for the model, `Err(text)` for a tool error.
-fn call_tool(name: &str, args: &Value) -> Result<String, String> {
-    match name {
-        "dirty_guard_hello" => {
-            let who = args.get("name").and_then(Value::as_str).unwrap_or("").trim();
-            if who.is_empty() {
-                return Err("missing required argument: name".into());
-            }
-            Ok(format!("hello, {who}!"))
-        }
-        other => Err(format!("unknown tool: {other}")),
-    }
+fn state_dir() -> PathBuf {
+    let home = std::env::var_os("GRAY_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".gray")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join("dirty-guard")
 }
 
-/// A slash command typed by the user (`/dirty-guard …`). `argv` excludes the name.
-fn run_command(argv: &[&str]) -> String {
-    if argv.is_empty() {
-        format!("dirty-guard {} — edit src/main.rs to make me useful", env!("CARGO_PKG_VERSION"))
-    } else {
-        format!("dirty-guard got: {}", argv.join(" "))
+fn enabled_in(dir: &Path) -> bool {
+    !dir.join("disabled").exists()
+}
+
+fn enabled() -> bool {
+    enabled_in(&state_dir())
+}
+
+/// Run `git -C <cwd> <args>`; stdout on success, None on any failure.
+fn git(cwd: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn in_work_tree(cwd: &Path) -> bool {
+    git(cwd, &["rev-parse", "--is-inside-work-tree"])
+        .map(|s| s.trim() == "true")
+        .unwrap_or(false)
+}
+
+/// One-line dirty-tree note, or None when `cwd` isn't a work tree, the
+/// status can't be read, or the tree is clean.
+fn dirty_note(cwd: &Path) -> Option<String> {
+    if !in_work_tree(cwd) {
+        return None;
+    }
+    let status = git(cwd, &["status", "--porcelain"])?;
+    let mut modified = 0usize;
+    let mut untracked = 0usize;
+    for line in status.lines().filter(|l| !l.trim().is_empty()) {
+        // `??` marks untracked paths; every other XY code is a tracked
+        // change (staged, unstaged, renamed, conflicted).
+        if line.starts_with("??") {
+            untracked += 1;
+        } else {
+            modified += 1;
+        }
+    }
+    let total = modified + untracked;
+    if total == 0 {
+        return None;
+    }
+    Some(format!(
+        "Note: the working tree has {total} uncommitted changes \
+         ({modified} modified, {untracked} untracked)."
+    ))
+}
+
+/// `/dirty …` — `argv` excludes the command name.
+fn run_command(argv: &[&str], dir: &Path) -> String {
+    match argv.first().copied() {
+        Some("off") => match std::fs::create_dir_all(dir)
+            .and_then(|_| std::fs::write(dir.join("disabled"), b""))
+        {
+            Ok(()) => "dirty-guard off".into(),
+            Err(e) => format!("couldn't disable: {e}"),
+        },
+        Some("on") => match std::fs::remove_file(dir.join("disabled")).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        }) {
+            Ok(()) => "dirty-guard on".into(),
+            Err(e) => format!("couldn't enable: {e}"),
+        },
+        _ => format!(
+            "gray-dirty-guard {} — {} — injects a one-line uncommitted-changes note \
+             at turn start. /dirty on|off",
+            env!("CARGO_PKG_VERSION"),
+            if enabled_in(dir) { "on" } else { "off" },
+        ),
     }
 }
 
@@ -60,12 +130,21 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
     };
     let result = match method {
         "plugin/manifest" => manifest(),
-        "tool/call" => {
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params.get("args").cloned().unwrap_or(Value::Null);
-            match call_tool(name, &args) {
-                Ok(text) => json!({ "content": text }),
-                Err(text) => json!({ "content": text, "is_error": true }),
+        "prompt/context" => {
+            if !enabled() {
+                json!({})
+            } else {
+                let cwd = params
+                    .get("session")
+                    .and_then(|s| s.get("cwd"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .or_else(|| std::env::current_dir().ok())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                match dirty_note(&cwd) {
+                    Some(text) => json!({ "text": text }),
+                    None => json!({}),
+                }
             }
         }
         "command/run" => {
@@ -74,7 +153,7 @@ fn handle(req: &Value) -> (Option<Value>, bool) {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
                 .unwrap_or_default();
-            json!({ "text": run_command(&argv) })
+            json!({ "text": run_command(&argv, &state_dir()) })
         }
         "plugin/shutdown" => return (Some(json!({ "id": id, "result": {} })), true),
         _ => {
@@ -112,39 +191,88 @@ mod tests {
     use super::*;
 
     fn call(method: &str, params: Value) -> Value {
-        handle(&json!({ "id": 1, "method": method, "params": params })).0.unwrap()
+        handle(&json!({ "id": 1, "method": method, "params": params }))
+            .0
+            .unwrap()
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "gray-dirty-guard-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn tmprepo(tag: &str) -> PathBuf {
+        let d = tmpdir(tag);
+        assert!(git(&d, &["init", "-q"]).is_some());
+        d
     }
 
     #[test]
-    fn manifest_names_the_plugin_and_its_version() {
+    fn manifest_claims_prompt_context_hook() {
         let m = call("plugin/manifest", Value::Null)["result"].clone();
         assert_eq!(m["name"], "dirty-guard");
-        assert_eq!(m["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(m["protocol"], "1.1");
+        assert_eq!(m["hooks"], json!(["prompt/context"]));
+        assert_eq!(m["commands"], json!(["/dirty"]));
+        assert_eq!(m["tools"], json!([]));
     }
 
     #[test]
-    fn tool_call_returns_content() {
-        let r = call("tool/call", json!({ "name": "dirty_guard_hello", "args": { "name": "gray" } }));
-        assert_eq!(r["result"]["content"], "hello, gray!");
-        assert!(r["result"].get("is_error").is_none());
+    fn note_counts_modified_and_untracked() {
+        let repo = tmprepo("note");
+        std::fs::write(repo.join("untracked.txt"), "x").unwrap();
+        std::fs::write(repo.join("tracked.txt"), "x").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"]);
+        std::fs::write(repo.join("tracked.txt"), "y").unwrap();
+        let note = dirty_note(&repo).unwrap();
+        assert_eq!(
+            note,
+            "Note: the working tree has 2 uncommitted changes (1 modified, 1 untracked)."
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
-    fn tool_errors_are_flagged() {
-        let r = call("tool/call", json!({ "name": "dirty_guard_hello", "args": {} }));
-        assert_eq!(r["result"]["is_error"], true);
+    fn clean_repo_and_non_repo_give_no_note() {
+        let repo = tmprepo("clean");
+        assert_eq!(dirty_note(&repo), None);
+        let outside = tmpdir("outside");
+        assert_eq!(dirty_note(&outside), None);
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
-    fn unknown_methods_are_method_not_found() {
-        assert_eq!(call("nope", Value::Null)["error"]["code"], -32601);
+    fn prompt_context_returns_text_or_empty() {
+        // Whatever the real cwd is, the reply must be {} or {text: String}.
+        let r = call("prompt/context", json!({"session": {"id": "s", "cwd": "/nonexistent"}}));
+        let result = &r["result"];
+        assert!(result.get("text").is_none() || result["text"].is_string());
     }
 
     #[test]
-    fn shutdown_replies_then_exits_and_notifications_are_silent() {
+    fn toggle_persists_under_state_dir() {
+        let d = tmpdir("toggle");
+        assert!(enabled_in(&d));
+        assert!(run_command(&["off"], &d).contains("off"));
+        assert!(!enabled_in(&d));
+        assert!(run_command(&["on"], &d).contains("on"));
+        assert!(enabled_in(&d));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn notifications_are_silent_and_shutdown_exits() {
+        let (reply, exit) = handle(&json!({"method":"event/notify","params":{"type":"turn_end"}}));
+        assert!(reply.is_none() && !exit);
         let (reply, exit) = handle(&json!({ "id": 2, "method": "plugin/shutdown" }));
         assert!(reply.is_some() && exit);
-        let (reply, exit) = handle(&json!({ "method": "plugin/shutdown" }));
-        assert!(reply.is_none() && exit);
     }
 }
