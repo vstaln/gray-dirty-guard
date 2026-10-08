@@ -1,0 +1,17 @@
+[package]
+name = "gray-dirty-guard"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT"
+description = "Inject a one-line uncommitted-changes note into context at turn start. Port of pi's dirty-repo-guard extension."
+
+[[bin]]
+name = "gray-dirty-guard"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[profile.release]
+strip = true
