@@ -1,8 +1,7 @@
 //! gray-dirty-guard — tell the model the work tree is dirty before it edits.
 //!
-//! Port of pi's `dirty-repo-guard` extension, adapted to the wire: pi blocked
-//! session switches behind a UI prompt; the sidecar has no UI, so instead it
-//! answers `prompt/context` with a single line —
+//! The sidecar has no UI to block behind, so it answers
+//! `prompt/context` with a single line —
 //! "Note: the working tree has N uncommitted changes (M modified, U untracked)."
 //! — so the model knows the repo state before touching files. Outside a git
 //! work tree it returns `{}` and stays silent.
