@@ -20,6 +20,7 @@ fn manifest() -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "protocol": "1.1",
         "tools": [],
+        "description": "note",
         "commands": ["/dirty"],
         "hooks": ["prompt/context"],
     })
