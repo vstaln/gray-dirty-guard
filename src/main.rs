@@ -22,6 +22,7 @@ fn manifest() -> Value {
         "tools": [],
         "description": "note uncommitted changes at turn start",
         "commands": ["/dirty"],
+        "command_descriptions": {"/dirty": "toggle dirty work-tree warnings"},
         "hooks": ["prompt/context"],
     })
 }
