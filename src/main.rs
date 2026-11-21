@@ -174,7 +174,9 @@ fn main() -> std::io::Result<()> {
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines() {
         let line = line?;
-        let Ok(req) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let (reply, exit) = handle(&req);
         if let Some(reply) = reply {
             writeln!(stdout, "{reply}")?;
@@ -230,7 +232,18 @@ mod tests {
         std::fs::write(repo.join("untracked.txt"), "x").unwrap();
         std::fs::write(repo.join("tracked.txt"), "x").unwrap();
         git(&repo, &["add", "tracked.txt"]);
-        git(&repo, &["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "i"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "i",
+            ],
+        );
         std::fs::write(repo.join("tracked.txt"), "y").unwrap();
         let note = dirty_note(&repo).unwrap();
         assert_eq!(
@@ -253,7 +266,10 @@ mod tests {
     #[test]
     fn prompt_context_returns_text_or_empty() {
         // Whatever the real cwd is, the reply must be {} or {text: String}.
-        let r = call("prompt/context", json!({"session": {"id": "s", "cwd": "/nonexistent"}}));
+        let r = call(
+            "prompt/context",
+            json!({"session": {"id": "s", "cwd": "/nonexistent"}}),
+        );
         let result = &r["result"];
         assert!(result.get("text").is_none() || result["text"].is_string());
     }
